@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(cpp_ss_server CXX)
+project(ss_server CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,14 +10,15 @@ add_executable(ss_server
         src/crypto.cpp
 )
 
-# --- Find libsodium ---
+# ---- libsodium (for chacha20-ietf-poly1305 AEAD) ----
 
-# Common Homebrew locations (Apple Silicon + Intel)
+# Common Homebrew / Linux locations
 set(SODIUM_HINT_DIRS
-        /opt/homebrew/include        # headers
+        /opt/homebrew/include
         /opt/homebrew/opt/libsodium/include
         /usr/local/include
         /usr/local/opt/libsodium/include
+        /usr/include
 )
 
 set(SODIUM_LIB_HINT_DIRS
@@ -25,6 +26,8 @@ set(SODIUM_LIB_HINT_DIRS
         /opt/homebrew/opt/libsodium/lib
         /usr/local/lib
         /usr/local/opt/libsodium/lib
+        /usr/lib
+        /usr/lib/x86_64-linux-gnu
 )
 
 find_path(SODIUM_INCLUDE_DIR
@@ -49,4 +52,18 @@ message(STATUS "Found libsodium include: ${SODIUM_INCLUDE_DIR}")
 message(STATUS "Found libsodium library: ${SODIUM_LIBRARY}")
 
 target_include_directories(ss_server PRIVATE ${SODIUM_INCLUDE_DIR})
-target_link_libraries(ss_server PRIVATE ${SODIUM_LIBRARY} pthread)
+
+# ---- OpenSSL (for MD5 KDF + HMAC-SHA1 HKDF) ----
+
+find_package(OpenSSL REQUIRED)
+
+if (NOT OpenSSL_FOUND)
+    message(FATAL_ERROR "OpenSSL not found")
+endif()
+
+target_link_libraries(ss_server
+        PRIVATE
+        ${SODIUM_LIBRARY}
+        OpenSSL::Crypto
+        pthread
+)

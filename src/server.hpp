@@ -1,8 +1,7 @@
-// src/server.hpp
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <string>
 
 class Server {
 public:
@@ -13,8 +12,4 @@ private:
     std::string host_;
     uint16_t port_;
     std::string password_;
-    int listen_fd_;
-
-    void setup_listener();
-    void handle_client(int client_fd);
 };
