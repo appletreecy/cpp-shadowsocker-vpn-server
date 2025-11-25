@@ -2,7 +2,7 @@ name: Build & Deploy Shadowsocks Server
 
 on:
   push:
-    branches: [ "main" ]  # or your main branch name
+    branches: [ "main" ]  # change if your main branch is different
 
 permissions:
   contents: read
@@ -48,23 +48,24 @@ jobs:
 
       - name: Deploy on Linode via SSH
         env:
+          LINODE_HOST: ${{ secrets.LINODE_HOST }}
+          LINODE_SSH_USER: ${{ secrets.LINODE_SSH_USER }}   # set to 'root' in your secrets
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
           SS_PASSWORD: ${{ secrets.SS_PASSWORD }}
         run: |
-          ssh ${{ secrets.LINODE_SSH_USER }}@${{ secrets.LINODE_HOST }} << 'EOF'
+          ssh "${LINODE_SSH_USER}@${LINODE_HOST}" << EOF
           set -e
 
           cd /root/vpn-stack
 
           # Login to GHCR on Linode
-          echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_REPOSITORY_OWNER}" --password-stdin || true
+          echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_OWNER}" --password-stdin || true
 
-          # Pull latest image & start
+          # Export Shadowsocks password for docker-compose env
           export SS_PASSWORD="${SS_PASSWORD}"
 
+          # Pull latest image & restart
           docker compose pull
           docker compose up -d
           EOF
-        shell: bash
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
