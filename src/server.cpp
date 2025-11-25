@@ -344,5 +344,5 @@ void Server::handle_client(int client_fd) {
 
     close(remote_fd);
     close(client_fd);
-    std::cout << "[*] Client closed\n";
+    std::cout << "[*] Client closed.\n";
 }
