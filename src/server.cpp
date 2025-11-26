@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+// ======================
+// Helpers
+// ======================
+
 namespace {
 
 bool read_n(int fd, uint8_t* buf, size_t n) {
@@ -88,7 +92,10 @@ static std::string hex_nonce(const NonceCounter& n) {
     return s;
 }
 
-// --- client -> remote: with detailed logging ---
+// ======================
+// TCP relay: client -> remote
+// ======================
+
 void client_to_remote(int client_fd, int remote_fd,
                       CryptoState& crypto,
                       NonceCounter& recv_nonce) {
@@ -187,11 +194,14 @@ void client_to_remote(int client_fd, int remote_fd,
     }
 }
 
+// ======================
+// TCP relay: remote -> client
+// ======================
+
 void remote_to_client(int remote_fd, int client_fd,
                       CryptoState& crypto,
                       NonceCounter& send_nonce) {
     uint8_t buf[4096];
-
     uint64_t chunk_id = 0;
 
     while (true) {
@@ -240,6 +250,10 @@ void remote_to_client(int remote_fd, int client_fd,
         }
     }
 }
+
+// ======================
+// Handle one TCP client
+// ======================
 
 void handle_client(int client_fd, const std::string& password) {
     std::cerr << "[*] New client\n";
@@ -433,27 +447,27 @@ void handle_client(int client_fd, const std::string& password) {
     std::cerr << "[*] Client done\n";
 }
 
-// ------------------------
-// UDP relay loop
-// ------------------------
+// ======================
+// UDP relay loop (Shadowsocks AEAD)
+// ======================
 
-void udp_server_loop(uint16_t port, std::string password) {
-    std::cerr << "Starting UDP relay on port " << port << "\n";
+void udp_server_loop(uint16_t port, const std::string& password) {
+    std::cerr << "[UDP] Starting UDP relay on port " << port << "\n";
 
     if (!crypto_global_init()) {
-        std::cerr << "crypto_global_init failed in UDP loop\n";
+        std::cerr << "[UDP] crypto_global_init failed\n";
         return;
     }
 
     CryptoState master{};
     if (!crypto_init_master(master, password)) {
-        std::cerr << "crypto_init_master failed in UDP loop\n";
+        std::cerr << "[UDP] crypto_init_master failed\n";
         return;
     }
 
     int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
     if (fd < 0) {
-        perror("socket(udp)");
+        perror("[UDP] socket");
         return;
     }
 
@@ -467,12 +481,12 @@ void udp_server_loop(uint16_t port, std::string password) {
 
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr),
                sizeof(addr)) < 0) {
-        perror("bind(udp)");
+        perror("[UDP] bind");
         ::close(fd);
         return;
     }
 
-    std::cerr << "UDP relay listening on [::]:" << port << "\n";
+    std::cerr << "[UDP] listening on [::]:" << port << "\n";
 
     uint8_t buf[65535];
 
@@ -485,10 +499,12 @@ void udp_server_loop(uint16_t port, std::string password) {
                                &cli_len);
         if (r < 0) {
             if (errno == EINTR) continue;
-            perror("recvfrom(udp)");
+            perror("[UDP] recvfrom");
             continue;
         }
         if (r == 0) continue;
+
+        std::cerr << "[UDP] got " << r << " bytes from client\n";
 
         std::vector<uint8_t> plain;
         if (!ss_udp_decrypt(master, buf, static_cast<size_t>(r), plain)) {
@@ -572,7 +588,7 @@ void udp_server_loop(uint16_t port, std::string password) {
             continue;
         }
 
-        // For now: per-packet remote UDP socket, single reply
+        // Per-packet remote UDP socket (simple but correct)
         struct addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_DGRAM;
@@ -634,6 +650,7 @@ void udp_server_loop(uint16_t port, std::string password) {
         ::close(rfd);
 
         // Build response payload: reuse original ADDR header + reply data
+        // (i.e., everything up to 'off' is the header).
         std::vector<uint8_t> resp_plain;
         resp_plain.reserve(off + static_cast<size_t>(rr));
         resp_plain.insert(resp_plain.end(), plain.begin(), plain.begin() + static_cast<long>(off));
@@ -666,6 +683,10 @@ void udp_server_loop(uint16_t port, std::string password) {
 
 } // namespace
 
+// ======================
+// Server implementation
+// ======================
+
 Server::Server(const std::string& host, uint16_t port, const std::string& password)
     : host_(host), port_(port), password_(password) {}
 
@@ -687,6 +708,9 @@ void Server::run() {
 
     int enable = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+
+    int v6only = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
     // Bind as IPv6, but allow IPv4-mapped addresses.
     struct sockaddr_in6 addr{};
