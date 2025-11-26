@@ -9,6 +9,19 @@
 #include <iostream>
 #include <vector>
 
+// Simple hex helper for debugging
+static std::string to_hex(const uint8_t* data, size_t len) {
+    static const char* hexd = "0123456789abcdef";
+    std::string s;
+    s.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t b = data[i];
+        s.push_back(hexd[b >> 4]);
+        s.push_back(hexd[b & 0x0F]);
+    }
+    return s;
+}
+
 // ------------------------
 // Global init
 // ------------------------
@@ -63,6 +76,10 @@ bool crypto_init_master(CryptoState& state, const std::string& password) {
 
     state.has_master = true;
     state.has_subkey = false;
+
+    // Debug: print master key (matches Python's master_key)
+    std::cerr << "[CRYPTO] master_key=" << to_hex(state.master_key, SS_KEY_LEN) << "\n";
+
     return true;
 }
 
@@ -76,7 +93,7 @@ void hkdf_sha1(const uint8_t* key,  size_t key_len,
                const uint8_t* salt, size_t salt_len,
                const uint8_t* info, size_t info_len,
                uint8_t* out,       size_t out_len) {
-    // Extract: PRK = HMAC(salt, IKM)
+    // Extract: PRK = HMAC(salt, IKM = key)
     unsigned char prk[EVP_MAX_MD_SIZE];
     unsigned int prk_len = 0;
 
@@ -140,6 +157,9 @@ bool crypto_init_session_from_salt(CryptoState& state,
         return false;
     }
 
+    // Debug: show salt we received (should match Python's "salt")
+    std::cerr << "[CRYPTO] salt=" << to_hex(salt, salt_len) << "\n";
+
     static const uint8_t info[] = { 's','s','-','s','u','b','k','e','y' };
 
     hkdf_sha1(state.master_key, SS_KEY_LEN,
@@ -148,6 +168,10 @@ bool crypto_init_session_from_salt(CryptoState& state,
               state.subkey, SS_KEY_LEN);
 
     state.has_subkey = true;
+
+    // Debug: show derived subkey (should match Python's "subkey")
+    std::cerr << "[CRYPTO] subkey=" << to_hex(state.subkey, SS_KEY_LEN) << "\n";
+
     return true;
 }
 
@@ -258,9 +282,12 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
             nullptr, 0,
             tmp_nonce.nonce,
             state.subkey) != 0) {
+        std::cerr << "[CRYPTO] ss_decrypt_chunk: length decrypt failed\n";
         return DecryptStatus::ERROR;
     }
     if (len_plain_len != sizeof(len_plain)) {
+        std::cerr << "[CRYPTO] ss_decrypt_chunk: unexpected len_plain_len="
+                  << len_plain_len << "\n";
         return DecryptStatus::ERROR;
     }
     nonce_increment(tmp_nonce);
@@ -269,6 +296,7 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
                          static_cast<uint16_t>(len_plain[1]);
     len_field &= 0x3FFF;
     if (len_field == 0 || len_field > SS_MAX_PAYLOAD) {
+        std::cerr << "[CRYPTO] ss_decrypt_chunk: invalid len_field=" << len_field << "\n";
         return DecryptStatus::ERROR;
     }
 
@@ -291,9 +319,12 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
             nullptr, 0,
             tmp_nonce.nonce,
             state.subkey) != 0) {
+        std::cerr << "[CRYPTO] ss_decrypt_chunk: payload decrypt failed\n";
         return DecryptStatus::ERROR;
     }
     if (out_len != len_field) {
+        std::cerr << "[CRYPTO] ss_decrypt_chunk: out_len("
+                  << out_len << ") != len_field(" << len_field << ")\n";
         return DecryptStatus::ERROR;
     }
     nonce_increment(tmp_nonce);
@@ -309,7 +340,7 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
 // ------------------------
 
 // UDP: [salt][encrypted payload][tag]
-// Each packet uses a fresh salt and subkey, nonce is all-zero for a single AEAD op.
+// Payload = [ADDR][UDP data], nonce is all-zero per packet.
 
 bool ss_udp_decrypt(const CryptoState& master_state,
                     const uint8_t* in,
