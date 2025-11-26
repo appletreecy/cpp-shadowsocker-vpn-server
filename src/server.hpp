@@ -3,13 +3,17 @@
 #include <cstdint>
 #include <string>
 
-class Server {
+class ShadowsocksServer {
 public:
-    Server(const std::string& host, uint16_t port, const std::string& password);
+    ShadowsocksServer(const std::string& host,
+                      uint16_t port,
+                      const std::string& password);
+
+    // Blocking run() – starts TCP listener (and optionally UDP in server.cpp)
     void run();
 
 private:
-    std::string host_;
-    uint16_t port_;
+    std::string listen_host_;
+    uint16_t listen_port_;
     std::string password_;
 };
