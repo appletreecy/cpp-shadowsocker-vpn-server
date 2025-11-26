@@ -35,7 +35,7 @@ bool crypto_init_master(CryptoState& state, const std::string& password) {
         return false;
     }
 
-    const EVP_CIPHER* cipher = EVP_aes_256_cfb(); // we only care key_len=32
+    const EVP_CIPHER* cipher = EVP_aes_256_cfb(); // key_len=32
     const EVP_MD* md = EVP_md5();
 
     unsigned char key[EVP_MAX_KEY_LENGTH];
@@ -79,6 +79,14 @@ void hkdf_sha1(const uint8_t* key,  size_t key_len,
     // Extract: PRK = HMAC(salt, IKM)
     unsigned char prk[EVP_MAX_MD_SIZE];
     unsigned int prk_len = 0;
+
+    // If salt is empty, use zeros of hash length (RFC5869 recommendation)
+    unsigned char zero_salt[EVP_MAX_MD_SIZE];
+    if (salt == nullptr || salt_len == 0) {
+        std::memset(zero_salt, 0, EVP_MD_size(EVP_sha1()));
+        salt = zero_salt;
+        salt_len = EVP_MD_size(EVP_sha1());
+    }
 
     HMAC(EVP_sha1(),
          salt, static_cast<int>(salt_len),
@@ -216,6 +224,7 @@ bool ss_encrypt_chunk(const CryptoState& state,
     return true;
 }
 
+// FIXED: do not advance real nonce on NEED_MORE
 DecryptStatus ss_decrypt_chunk(const CryptoState& state,
                                NonceCounter& nonce,
                                const uint8_t* in,
@@ -228,26 +237,33 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
     if (!state.has_subkey) return DecryptStatus::ERROR;
 
     const size_t len_ct_total = 2 + SS_TAG_LEN;
+
+    // Not enough even for encrypted length
     if (in_len < len_ct_total) {
         return DecryptStatus::NEED_MORE;
     }
 
+    // Work on a *copy* of the nonce so that in NEED_MORE case
+    // we do NOT advance the real nonce.
+    NonceCounter tmp_nonce = nonce;
+
     uint8_t len_plain[2];
     unsigned long long len_plain_len = sizeof(len_plain);
 
+    // Decrypt length with tmp_nonce
     if (crypto_aead_chacha20poly1305_ietf_decrypt(
             len_plain, &len_plain_len,
             nullptr,
             in, len_ct_total,
             nullptr, 0,
-            nonce.nonce,
+            tmp_nonce.nonce,
             state.subkey) != 0) {
         return DecryptStatus::ERROR;
     }
     if (len_plain_len != sizeof(len_plain)) {
         return DecryptStatus::ERROR;
     }
-    nonce_increment(nonce);
+    nonce_increment(tmp_nonce);
 
     uint16_t len_field = (static_cast<uint16_t>(len_plain[0]) << 8) |
                          static_cast<uint16_t>(len_plain[1]);
@@ -257,7 +273,10 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
     }
 
     size_t payload_ct_len = len_field + SS_TAG_LEN;
+
+    // Check if we have the full payload ciphertext *before* touching the real nonce
     if (in_len < len_ct_total + payload_ct_len) {
+        // Not enough data for the full chunk; do NOT change real nonce.
         return DecryptStatus::NEED_MORE;
     }
 
@@ -270,15 +289,17 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
             in + len_ct_total,
             payload_ct_len,
             nullptr, 0,
-            nonce.nonce,
+            tmp_nonce.nonce,
             state.subkey) != 0) {
         return DecryptStatus::ERROR;
     }
     if (out_len != len_field) {
         return DecryptStatus::ERROR;
     }
-    nonce_increment(nonce);
+    nonce_increment(tmp_nonce);
 
+    // Only now commit the updated nonce and consumed size
+    nonce = tmp_nonce;
     consumed = len_ct_total + payload_ct_len;
     return DecryptStatus::OK;
 }
