@@ -5,16 +5,14 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <sodium.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <functional>
 #include <iostream>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,89 +164,6 @@ static int connect_remote(const std::string& host, uint16_t port) {
         std::cerr << "Failed to connect to " << host << ":" << port << "\n";
     }
     return fd;
-}
-
-// ========= UDP AEAD helpers =========
-
-// Decrypt SS-UDP packet: data = salt + AEAD(ADDR+PAYLOAD)
-static bool ss_udp_decrypt(const CryptoState& base,
-                           const uint8_t* data,
-                           size_t len,
-                           std::vector<uint8_t>& addr_plus_payload_out) {
-    if (len < SS_SALT_LEN + SS_TAG_LEN + 1) {
-        return false;
-    }
-
-    const uint8_t* salt = data;
-    const uint8_t* ct   = data + SS_SALT_LEN;
-    size_t ct_len       = len - SS_SALT_LEN;
-
-    CryptoState session = base;
-    if (!crypto_init_session_from_salt(session, salt, SS_SALT_LEN)) {
-        std::cerr << "[UDP] crypto_init_session_from_salt failed\n";
-        return false;
-    }
-
-    std::vector<uint8_t> plain(ct_len); // will shrink later
-    unsigned long long mlen = 0;
-    uint8_t nonce[SS_NONCE_LEN] = {0};
-
-    if (crypto_aead_chacha20poly1305_ietf_decrypt(
-            plain.data(),
-            &mlen,
-            nullptr,
-            ct,
-            ct_len,
-            nullptr,
-            0,
-            nonce,
-            session.subkey) != 0) {
-        std::cerr << "[UDP] decrypt failed\n";
-        return false;
-    }
-
-    plain.resize(static_cast<size_t>(mlen));
-    addr_plus_payload_out = std::move(plain);
-    return true;
-}
-
-// Encrypt SS-UDP packet: out = salt + AEAD(ADDR+PAYLOAD)
-static bool ss_udp_encrypt(const CryptoState& base,
-                           const std::vector<uint8_t>& addr_plus_payload,
-                           std::vector<uint8_t>& out_packet) {
-    uint8_t salt[SS_SALT_LEN];
-    randombytes_buf(salt, SS_SALT_LEN);
-
-    CryptoState session = base;
-    if (!crypto_init_session_from_salt(session, salt, SS_SALT_LEN)) {
-        std::cerr << "[UDP] crypto_init_session_from_salt failed\n";
-        return false;
-    }
-
-    std::vector<uint8_t> ct(addr_plus_payload.size() + SS_TAG_LEN);
-    unsigned long long ct_len = 0;
-    uint8_t nonce[SS_NONCE_LEN] = {0};
-
-    if (crypto_aead_chacha20poly1305_ietf_encrypt(
-            ct.data(),
-            &ct_len,
-            addr_plus_payload.data(),
-            addr_plus_payload.size(),
-            nullptr,
-            0,
-            nullptr,
-            nonce,
-            session.subkey) != 0) {
-        std::cerr << "[UDP] encrypt failed\n";
-        return false;
-    }
-
-    ct.resize(static_cast<size_t>(ct_len));
-    out_packet.clear();
-    out_packet.reserve(SS_SALT_LEN + ct.size());
-    out_packet.insert(out_packet.end(), salt, salt + SS_SALT_LEN);
-    out_packet.insert(out_packet.end(), ct.begin(), ct.end());
-    return true;
 }
 
 // ========= TCP per-client handler =========
@@ -501,6 +416,9 @@ static void handle_client_tcp(int client_fd, std::string password) {
 }
 
 // ========= UDP relay loop =========
+//
+// Uses ss_udp_decrypt/ss_udp_encrypt declared in crypto.hpp
+// and implemented in crypto.cpp, so NO static redefinitions here.
 
 static void udp_server_loop(uint16_t listen_port, std::string password) {
     int sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
@@ -527,8 +445,8 @@ static void udp_server_loop(uint16_t listen_port, std::string password) {
 
     std::cout << "[UDP] listening on 0.0.0.0:" << listen_port << "\n";
 
-    CryptoState base{};
-    if (!crypto_init_master(base, password)) {
+    CryptoState master_state{};
+    if (!crypto_init_master(master_state, password)) {
         std::cerr << "[UDP] crypto_init_master failed\n";
         ::close(sock);
         return;
@@ -555,7 +473,7 @@ static void udp_server_loop(uint16_t listen_port, std::string password) {
         std::cout << "[UDP] got " << n << " bytes from client\n";
 
         std::vector<uint8_t> addr_plus_payload;
-        if (!ss_udp_decrypt(base,
+        if (!ss_udp_decrypt(master_state,
                             buf.data(),
                             static_cast<size_t>(n),
                             addr_plus_payload)) {
@@ -612,13 +530,12 @@ static void udp_server_loop(uint16_t listen_port, std::string password) {
             continue;
         }
 
-        // Wait for a single response (good enough for DNS/most UDP)
+        // Wait for a single response (good for DNS/most UDP)
         struct pollfd pfd;
         pfd.fd     = rsock;
         pfd.events = POLLIN;
         int pret   = ::poll(&pfd, 1, 1500); // 1.5s timeout
         if (pret <= 0) {
-            // timeout or error – just ignore
             ::close(rsock);
             ::freeaddrinfo(res);
             continue;
@@ -647,7 +564,7 @@ static void udp_server_loop(uint16_t listen_port, std::string password) {
         resp_plain.insert(resp_plain.end(), rbuf.begin(), rbuf.begin() + rn);
 
         std::vector<uint8_t> out_packet;
-        if (!ss_udp_encrypt(base, resp_plain, out_packet)) {
+        if (!ss_udp_encrypt(master_state, resp_plain, out_packet)) {
             continue;
         }
 
