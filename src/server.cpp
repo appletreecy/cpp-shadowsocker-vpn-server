@@ -75,64 +75,114 @@ int connect_remote(const std::string& host, uint16_t port) {
     return fd;
 }
 
+// --- debug helper: print nonce as hex ---
+static std::string hex_nonce(const NonceCounter& n) {
+    static const char* hexd = "0123456789abcdef";
+    std::string s;
+    s.reserve(SS_NONCE_LEN * 2);
+    for (size_t i = 0; i < SS_NONCE_LEN; ++i) {
+        uint8_t b = n.nonce[i];
+        s.push_back(hexd[b >> 4]);
+        s.push_back(hexd[b & 0x0F]);
+    }
+    return s;
+}
+
+// --- client -> remote: with detailed logging ---
 void client_to_remote(int client_fd, int remote_fd,
                       CryptoState& crypto,
                       NonceCounter& recv_nonce) {
     std::vector<uint8_t> inbuf;
     inbuf.reserve(4096);
 
+    uint64_t chunk_id = 0;
+
     while (true) {
         uint8_t tmp[4096];
         ssize_t r = ::recv(client_fd, tmp, sizeof(tmp), 0);
         if (r == 0) {
-            // client closed
+            std::cerr << "[C->R] client_fd EOF, shutting down remote write\n";
             shutdown(remote_fd, SHUT_WR);
             return;
         }
         if (r < 0) {
             if (errno == EINTR) continue;
-            perror("recv(client)");
+            perror("[C->R] recv(client) error");
             shutdown(remote_fd, SHUT_WR);
             return;
         }
 
         inbuf.insert(inbuf.end(), tmp, tmp + r);
+        std::cerr << "[C->R] recv() got " << r
+                  << " bytes, inbuf=" << inbuf.size() << "\n";
 
         while (!inbuf.empty()) {
             size_t consumed = 0;
             std::vector<uint8_t> plain;
+
+            std::cerr << "[C->R]   decrypt try: chunk_id=" << chunk_id
+                      << " inbuf=" << inbuf.size()
+                      << " nonce=" << hex_nonce(recv_nonce) << "\n";
+
             DecryptStatus st = ss_decrypt_chunk(
-                crypto, recv_nonce, inbuf.data(), inbuf.size(),
+                crypto, recv_nonce,
+                inbuf.data(), inbuf.size(),
                 consumed, plain
             );
 
             if (st == DecryptStatus::NEED_MORE) {
-                // Need more data from client
+                std::cerr << "[C->R]   NEED_MORE for chunk_id=" << chunk_id
+                          << " (inbuf=" << inbuf.size() << ")\n";
                 if (inbuf.size() > 65536) {
-                    std::cerr << "Too much encrypted data without complete chunk\n";
+                    std::cerr << "[C->R]   ERROR: inbuf too large without full chunk, aborting\n";
                     shutdown(remote_fd, SHUT_WR);
                     return;
                 }
-                break;
+                break; // wait for more data from client
             }
 
             if (st == DecryptStatus::ERROR) {
-                std::cerr << "Decrypt error in client_to_remote\n";
+                std::cerr << "[C->R]   ERROR: ss_decrypt_chunk failed for chunk_id="
+                          << chunk_id << "\n";
+                std::cerr << "[C->R]   inbuf.size()=" << inbuf.size()
+                          << " consumed=" << consumed << "\n";
+                size_t dump_len = std::min<size_t>(inbuf.size(), 64);
+                std::cerr << "[C->R]   ciphertext prefix (hex, first "
+                          << dump_len << " bytes):\n  ";
+                static const char* hexd = "0123456789abcdef";
+                for (size_t i = 0; i < dump_len; ++i) {
+                    uint8_t b = inbuf[i];
+                    std::cerr << hexd[b >> 4] << hexd[b & 0x0F];
+                }
+                std::cerr << "\n";
                 shutdown(remote_fd, SHUT_WR);
                 return;
             }
 
             // OK
-            inbuf.erase(inbuf.begin(),
-                        inbuf.begin() + static_cast<long>(consumed));
+            std::cerr << "[C->R]   OK: chunk_id=" << chunk_id
+                      << " consumed=" << consumed
+                      << " plain.size()=" << plain.size() << "\n";
+
+            if (consumed > 0) {
+                inbuf.erase(
+                    inbuf.begin(),
+                    inbuf.begin() + static_cast<long>(consumed)
+                );
+            }
 
             if (!plain.empty()) {
                 if (!send_all(remote_fd,
                               plain.data(), plain.size())) {
+                    std::cerr << "[C->R]   ERROR: send_all(remote) failed\n";
                     shutdown(remote_fd, SHUT_WR);
                     return;
                 }
+                std::cerr << "[C->R]   forwarded " << plain.size()
+                          << " bytes to remote\n";
             }
+
+            ++chunk_id;
         }
     }
 }
@@ -142,19 +192,23 @@ void remote_to_client(int remote_fd, int client_fd,
                       NonceCounter& send_nonce) {
     uint8_t buf[4096];
 
+    uint64_t chunk_id = 0;
+
     while (true) {
         ssize_t r = ::recv(remote_fd, buf, sizeof(buf), 0);
         if (r == 0) {
-            // remote closed
+            std::cerr << "[R->C] remote_fd EOF, shutting down client write\n";
             shutdown(client_fd, SHUT_WR);
             return;
         }
         if (r < 0) {
             if (errno == EINTR) continue;
-            perror("recv(remote)");
+            perror("[R->C] recv(remote) error");
             shutdown(client_fd, SHUT_WR);
             return;
         }
+
+        std::cerr << "[R->C] recv() got " << r << " bytes from remote\n";
 
         size_t off = 0;
         while (off < static_cast<size_t>(r)) {
@@ -165,7 +219,8 @@ void remote_to_client(int remote_fd, int client_fd,
             std::vector<uint8_t> out_chunk;
             if (!ss_encrypt_chunk(crypto, send_nonce,
                                   buf + off, chunk_len, out_chunk)) {
-                std::cerr << "Encrypt error in remote_to_client\n";
+                std::cerr << "[R->C]   ERROR: ss_encrypt_chunk failed for chunk_id="
+                          << chunk_id << "\n";
                 shutdown(client_fd, SHUT_WR);
                 return;
             }
@@ -173,9 +228,15 @@ void remote_to_client(int remote_fd, int client_fd,
 
             if (!send_all(client_fd,
                           out_chunk.data(), out_chunk.size())) {
+                std::cerr << "[R->C]   ERROR: send_all(client) failed\n";
                 shutdown(client_fd, SHUT_WR);
                 return;
             }
+
+            std::cerr << "[R->C]   chunk_id=" << chunk_id
+                      << " enc+sent " << out_chunk.size()
+                      << " bytes to client\n";
+            ++chunk_id;
         }
     }
 }
