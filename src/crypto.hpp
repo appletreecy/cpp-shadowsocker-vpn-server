@@ -5,11 +5,11 @@
 #include <string>
 #include <vector>
 
-constexpr size_t SS_KEY_LEN    = 32;      // chacha20-ietf-poly1305 key
-constexpr size_t SS_SALT_LEN   = 32;      // recommended salt length
-constexpr size_t SS_NONCE_LEN  = 12;      // IETF nonce size
-constexpr size_t SS_TAG_LEN    = 16;      // chacha20poly1305 tag
-constexpr size_t SS_MAX_PAYLOAD = 0x3FFF; // per-chunk max payload
+constexpr size_t SS_KEY_LEN     = 32;      // chacha20-ietf-poly1305 key
+constexpr size_t SS_SALT_LEN    = 32;      // recommended salt length
+constexpr size_t SS_NONCE_LEN   = 12;      // IETF nonce size
+constexpr size_t SS_TAG_LEN     = 16;      // chacha20poly1305 tag
+constexpr size_t SS_MAX_PAYLOAD = 0x3FFF;  // per-chunk max payload (TCP)
 
 enum class DecryptStatus {
     OK,
@@ -56,3 +56,17 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
                                size_t in_len,
                                size_t& consumed,
                                std::vector<uint8_t>& plaintext_out);
+
+// ---------- UDP AEAD helpers ----------
+// UDP packet format: [salt][encrypted payload+tag]
+// Payload = [ADDR][UDP data], nonce is all-zero per packet.
+
+bool ss_udp_decrypt(const CryptoState& master_state,
+                    const uint8_t* in,
+                    size_t in_len,
+                    std::vector<uint8_t>& plaintext_out);
+
+bool ss_udp_encrypt(const CryptoState& master_state,
+                    const uint8_t* plaintext,
+                    size_t plaintext_len,
+                    std::vector<uint8_t>& out_packet);

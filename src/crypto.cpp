@@ -167,7 +167,7 @@ void nonce_increment(NonceCounter& n) {
 }
 
 // ------------------------
-// AEAD chunk helpers
+// AEAD TCP chunk helpers
 // ------------------------
 
 bool ss_encrypt_chunk(const CryptoState& state,
@@ -302,4 +302,110 @@ DecryptStatus ss_decrypt_chunk(const CryptoState& state,
     nonce = tmp_nonce;
     consumed = len_ct_total + payload_ct_len;
     return DecryptStatus::OK;
+}
+
+// ------------------------
+// UDP AEAD helpers
+// ------------------------
+
+// UDP: [salt][encrypted payload][tag]
+// Each packet uses a fresh salt and subkey, nonce is all-zero for a single AEAD op.
+
+bool ss_udp_decrypt(const CryptoState& master_state,
+                    const uint8_t* in,
+                    size_t in_len,
+                    std::vector<uint8_t>& plaintext_out) {
+    plaintext_out.clear();
+
+    if (!master_state.has_master) {
+        std::cerr << "ss_udp_decrypt: master key not set\n";
+        return false;
+    }
+    if (!in || in_len < SS_SALT_LEN + SS_TAG_LEN + 1) {
+        // must at least have salt + tag + 1 byte payload
+        return false;
+    }
+
+    const uint8_t* salt = in;
+    const uint8_t* ct   = in + SS_SALT_LEN;
+    size_t ct_len       = in_len - SS_SALT_LEN;
+
+    CryptoState st{};
+    std::memcpy(st.master_key, master_state.master_key, SS_KEY_LEN);
+    st.has_master = true;
+    if (!crypto_init_session_from_salt(st, salt, SS_SALT_LEN)) {
+        return false;
+    }
+
+    NonceCounter n;
+    nonce_reset(n); // all-zero nonce for UDP AEAD
+
+    if (ct_len < SS_TAG_LEN) {
+        return false;
+    }
+
+    plaintext_out.resize(ct_len - SS_TAG_LEN);
+    unsigned long long out_len = plaintext_out.size();
+
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            plaintext_out.data(), &out_len,
+            nullptr,
+            ct, ct_len,
+            nullptr, 0,
+            n.nonce,
+            st.subkey) != 0) {
+        return false;
+    }
+
+    plaintext_out.resize(static_cast<size_t>(out_len));
+    return true;
+}
+
+bool ss_udp_encrypt(const CryptoState& master_state,
+                    const uint8_t* plaintext,
+                    size_t plaintext_len,
+                    std::vector<uint8_t>& out_packet) {
+    out_packet.clear();
+
+    if (!master_state.has_master) {
+        std::cerr << "ss_udp_encrypt: master key not set\n";
+        return false;
+    }
+    if (!plaintext || plaintext_len == 0) {
+        return false;
+    }
+
+    uint8_t salt[SS_SALT_LEN];
+    randombytes_buf(salt, sizeof(salt));
+
+    CryptoState st{};
+    std::memcpy(st.master_key, master_state.master_key, SS_KEY_LEN);
+    st.has_master = true;
+    if (!crypto_init_session_from_salt(st, salt, SS_SALT_LEN)) {
+        return false;
+    }
+
+    NonceCounter n;
+    nonce_reset(n); // all-zero nonce per UDP packet
+
+    std::vector<uint8_t> ct(plaintext_len + SS_TAG_LEN);
+    unsigned long long ct_len = ct.size();
+
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            ct.data(), &ct_len,
+            plaintext, plaintext_len,
+            nullptr, 0,
+            nullptr,
+            n.nonce,
+            st.subkey) != 0) {
+        return false;
+    }
+
+    ct.resize(static_cast<size_t>(ct_len));
+
+    out_packet.reserve(SS_SALT_LEN + ct.size());
+    out_packet.insert(out_packet.end(), salt, salt + SS_SALT_LEN);
+    out_packet.insert(out_packet.end(), ct.begin(), ct.end());
+
+    return true;
 }

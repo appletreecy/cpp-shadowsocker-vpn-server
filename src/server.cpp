@@ -433,6 +433,237 @@ void handle_client(int client_fd, const std::string& password) {
     std::cerr << "[*] Client done\n";
 }
 
+// ------------------------
+// UDP relay loop
+// ------------------------
+
+void udp_server_loop(uint16_t port, std::string password) {
+    std::cerr << "Starting UDP relay on port " << port << "\n";
+
+    if (!crypto_global_init()) {
+        std::cerr << "crypto_global_init failed in UDP loop\n";
+        return;
+    }
+
+    CryptoState master{};
+    if (!crypto_init_master(master, password)) {
+        std::cerr << "crypto_init_master failed in UDP loop\n";
+        return;
+    }
+
+    int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        perror("socket(udp)");
+        return;
+    }
+
+    int v6only = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
+    struct sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    addr.sin6_addr = in6addr_any;
+
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr),
+               sizeof(addr)) < 0) {
+        perror("bind(udp)");
+        ::close(fd);
+        return;
+    }
+
+    std::cerr << "UDP relay listening on [::]:" << port << "\n";
+
+    uint8_t buf[65535];
+
+    while (true) {
+        struct sockaddr_storage cliaddr{};
+        socklen_t cli_len = sizeof(cliaddr);
+
+        ssize_t r = ::recvfrom(fd, buf, sizeof(buf), 0,
+                               reinterpret_cast<struct sockaddr*>(&cliaddr),
+                               &cli_len);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            perror("recvfrom(udp)");
+            continue;
+        }
+        if (r == 0) continue;
+
+        std::vector<uint8_t> plain;
+        if (!ss_udp_decrypt(master, buf, static_cast<size_t>(r), plain)) {
+            std::cerr << "[UDP] ss_udp_decrypt failed, dropping packet\n";
+            continue;
+        }
+
+        if (plain.size() < 4) {
+            std::cerr << "[UDP] decrypted payload too short\n";
+            continue;
+        }
+
+        size_t off = 0;
+        uint8_t atyp = plain[off++];
+
+        std::string target_host;
+        uint16_t target_port = 0;
+
+        if (atyp == 0x01) { // IPv4
+            if (plain.size() < off + 4 + 2) {
+                std::cerr << "[UDP] header too short for IPv4\n";
+                continue;
+            }
+            char addr_buf[INET_ADDRSTRLEN];
+            struct in_addr addr4{};
+            std::memcpy(&addr4, &plain[off], 4);
+            off += 4;
+            inet_ntop(AF_INET, &addr4, addr_buf, sizeof(addr_buf));
+            target_host = addr_buf;
+        } else if (atyp == 0x03) { // domain
+            if (plain.size() < off + 1) {
+                std::cerr << "[UDP] header too short for domain len\n";
+                continue;
+            }
+            uint8_t name_len = plain[off++];
+            if (plain.size() < off + name_len + 2) {
+                std::cerr << "[UDP] header too short for domain\n";
+                continue;
+            }
+            target_host.assign(
+                reinterpret_cast<char*>(&plain[off]),
+                reinterpret_cast<char*>(&plain[off]) + name_len
+            );
+            off += name_len;
+        } else if (atyp == 0x04) { // IPv6
+            if (plain.size() < off + 16 + 2) {
+                std::cerr << "[UDP] header too short for IPv6\n";
+                continue;
+            }
+            char addr_buf[INET6_ADDRSTRLEN];
+            struct in6_addr addr6{};
+            std::memcpy(&addr6, &plain[off], 16);
+            off += 16;
+            inet_ntop(AF_INET6, &addr6, addr_buf, sizeof(addr_buf));
+            target_host = addr_buf;
+        } else {
+            std::cerr << "[UDP] unsupported ATYP=" << int(atyp) << "\n";
+            continue;
+        }
+
+        if (plain.size() < off + 2) {
+            std::cerr << "[UDP] header too short for port\n";
+            continue;
+        }
+
+        target_port = (static_cast<uint16_t>(plain[off]) << 8) |
+                      static_cast<uint16_t>(plain[off + 1]);
+        off += 2;
+
+        std::vector<uint8_t> udp_payload;
+        if (off < plain.size()) {
+            udp_payload.assign(plain.begin() + static_cast<long>(off),
+                               plain.end());
+        }
+
+        std::cerr << "[UDP] target=" << target_host << ":" << target_port
+                  << " payload_len=" << udp_payload.size() << "\n";
+
+        if (udp_payload.empty()) {
+            // Nothing to send
+            continue;
+        }
+
+        // For now: per-packet remote UDP socket, single reply
+        struct addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        std::string port_str = std::to_string(target_port);
+        struct addrinfo* res = nullptr;
+        int rc = getaddrinfo(target_host.c_str(), port_str.c_str(),
+                             &hints, &res);
+        if (rc != 0) {
+            std::cerr << "[UDP] getaddrinfo(" << target_host << ":"
+                      << target_port << "): " << gai_strerror(rc) << "\n";
+            continue;
+        }
+
+        int rfd = -1;
+        for (auto* p = res; p; p = p->ai_next) {
+            rfd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (rfd < 0) continue;
+
+            ssize_t sent = ::sendto(rfd,
+                                    udp_payload.data(),
+                                    udp_payload.size(),
+                                    0,
+                                    p->ai_addr, p->ai_addrlen);
+            if (sent < 0) {
+                perror("[UDP] sendto(remote)");
+                ::close(rfd);
+                rfd = -1;
+                continue;
+            }
+            break;
+        }
+        freeaddrinfo(res);
+
+        if (rfd < 0) {
+            std::cerr << "[UDP] failed to send to remote\n";
+            continue;
+        }
+
+        // Set a short timeout for reply
+        struct timeval tv{};
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        setsockopt(rfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        uint8_t rbuf[65535];
+        struct sockaddr_storage raddr{};
+        socklen_t raddr_len = sizeof(raddr);
+
+        ssize_t rr = ::recvfrom(rfd, rbuf, sizeof(rbuf), 0,
+                                reinterpret_cast<struct sockaddr*>(&raddr),
+                                &raddr_len);
+        if (rr <= 0) {
+            // No reply or timeout: best-effort only
+            ::close(rfd);
+            continue;
+        }
+
+        ::close(rfd);
+
+        // Build response payload: reuse original ADDR header + reply data
+        std::vector<uint8_t> resp_plain;
+        resp_plain.reserve(off + static_cast<size_t>(rr));
+        resp_plain.insert(resp_plain.end(), plain.begin(), plain.begin() + static_cast<long>(off));
+        resp_plain.insert(resp_plain.end(), rbuf, rbuf + rr);
+
+        std::vector<uint8_t> out_packet;
+        if (!ss_udp_encrypt(master,
+                            resp_plain.data(), resp_plain.size(),
+                            out_packet)) {
+            std::cerr << "[UDP] ss_udp_encrypt failed for reply\n";
+            continue;
+        }
+
+        ssize_t s2 = ::sendto(fd,
+                              out_packet.data(),
+                              out_packet.size(),
+                              0,
+                              reinterpret_cast<struct sockaddr*>(&cliaddr),
+                              cli_len);
+        if (s2 < 0) {
+            perror("[UDP] sendto(client)");
+        } else {
+            std::cerr << "[UDP] sent reply packet of " << s2
+                      << " bytes back to client\n";
+        }
+    }
+
+    ::close(fd);
+}
+
 } // namespace
 
 Server::Server(const std::string& host, uint16_t port, const std::string& password)
@@ -443,6 +674,10 @@ void Server::run() {
         std::cerr << "crypto_global_init failed\n";
         return;
     }
+
+    // Start UDP relay thread
+    std::thread udp_thread(udp_server_loop, port_, password_);
+    udp_thread.detach();
 
     int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -471,7 +706,7 @@ void Server::run() {
         return;
     }
 
-    std::cerr << "Listening on " << host_ << ":" << port_ << "\n";
+    std::cerr << "Listening (TCP) on " << host_ << ":" << port_ << "\n";
 
     while (true) {
         struct sockaddr_storage cli_addr{};
