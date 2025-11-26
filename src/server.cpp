@@ -564,9 +564,13 @@ static void udp_server_loop(uint16_t listen_port, std::string password) {
         resp_plain.insert(resp_plain.end(), rbuf.begin(), rbuf.begin() + rn);
 
         std::vector<uint8_t> out_packet;
-        if (!ss_udp_encrypt(master_state, resp_plain, out_packet)) {
+        if (!ss_udp_encrypt(master_state,
+                            resp_plain.data(),
+                            resp_plain.size(),
+                            out_packet)) {
             continue;
         }
+
 
         // Send back to client
         ssize_t sn = ::sendto(sock,
