@@ -1,659 +1,714 @@
-#include "server.hpp"
+// src/server.cpp
 #include "crypto.hpp"
 
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <poll.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
-// ========= small helpers =========
+// ---------- small helpers ----------
 
-static void perror_msg(const char* msg) {
+static void perror_msg(const char *msg) {
     std::cerr << msg << ": " << std::strerror(errno) << "\n";
 }
 
-static bool send_all(int fd, const uint8_t* data, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = ::send(fd, data + sent, len - sent, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror_msg("send");
-            return false;
-        }
-        if (n == 0) {
-            // peer closed
-            return false;
-        }
-        sent += static_cast<size_t>(n);
-    }
+static bool set_nonblock(int fd) {
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return false;
     return true;
 }
 
-// Parse SS address header from |plain| (at offset 0)
-// Returns true on success, fills host, port, and header_len
-static bool parse_ss_target(const std::vector<uint8_t>& plain,
-                            std::string& host_out,
-                            uint16_t& port_out,
-                            size_t& header_len_out) {
-    if (plain.empty()) return false;
-    size_t idx = 0;
-    uint8_t atyp = plain[idx++];
+// hex for debug
+static std::string hex_str(const uint8_t *data, size_t len) {
+    static const char *hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(hex[data[i] >> 4]);
+        out.push_back(hex[data[i] & 0x0f]);
+    }
+    return out;
+}
+
+// ---------- Shadowsocks addr header helpers ----------
+
+static bool parse_ss_addr(const uint8_t *buf,
+                          size_t len,
+                          size_t &consumed,
+                          std::string &host,
+                          uint16_t &port) {
+    if (len < 1) return false;
+    uint8_t atyp = buf[0];
+    size_t off   = 1;
 
     if (atyp == 0x01) { // IPv4
-        if (plain.size() < idx + 4 + 2) return false;
-        char buf[INET_ADDRSTRLEN];
-        struct in_addr addr{};
-        std::memcpy(&addr, &plain[idx], 4);
-        idx += 4;
-        if (!::inet_ntop(AF_INET, &addr, buf, sizeof(buf))) {
-            perror_msg("inet_ntop IPv4");
+        if (len < off + 4 + 2) return false;
+        char ip[INET_ADDRSTRLEN];
+        std::memset(ip, 0, sizeof(ip));
+        if (!::inet_ntop(AF_INET, buf + off, ip, sizeof(ip))) {
             return false;
         }
-        host_out = buf;
-    } else if (atyp == 0x04) { // IPv6
-        if (plain.size() < idx + 16 + 2) return false;
-        char buf[INET6_ADDRSTRLEN];
-        struct in6_addr addr6{};
-        std::memcpy(&addr6, &plain[idx], 16);
-        idx += 16;
-        if (!::inet_ntop(AF_INET6, &addr6, buf, sizeof(buf))) {
-            perror_msg("inet_ntop IPv6");
-            return false;
-        }
-        host_out = buf;
+        host = ip;
+        off += 4;
     } else if (atyp == 0x03) { // domain
-        if (plain.size() < idx + 1) return false;
-        uint8_t len = plain[idx++];
-        if (plain.size() < idx + len + 2) return false;
-        host_out.assign(reinterpret_cast<const char*>(&plain[idx]), len);
-        idx += len;
+        if (len < off + 1) return false;
+        uint8_t dlen = buf[off++];
+        if (len < off + dlen + 2) return false;
+        host.assign(reinterpret_cast<const char*>(buf + off), dlen);
+        off += dlen;
+    } else if (atyp == 0x04) { // IPv6
+        if (len < off + 16 + 2) return false;
+        char ip[INET6_ADDRSTRLEN];
+        std::memset(ip, 0, sizeof(ip));
+        if (!::inet_ntop(AF_INET6, buf + off, ip, sizeof(ip))) {
+            return false;
+        }
+        host = ip;
+        off += 16;
     } else {
-        std::cerr << "Unsupported ATYP=" << static_cast<int>(atyp) << "\n";
         return false;
     }
 
-    // port
-    uint16_t p = (static_cast<uint16_t>(plain[idx]) << 8) |
-                 static_cast<uint16_t>(plain[idx + 1]);
-    idx += 2;
-    port_out = p;
-    header_len_out = idx;
+    port = static_cast<uint16_t>((buf[off] << 8) | buf[off + 1]);
+    off += 2;
+
+    consumed = off;
     return true;
 }
 
-// Build SS address header for host:port
-static bool build_ss_addr_header(const std::string& host,
+// Used by UDP reply path as well
+static bool build_ss_addr_header(const std::string &host,
                                  uint16_t port,
-                                 std::vector<uint8_t>& out) {
+                                 std::vector<uint8_t> &out) {
     out.clear();
+    in_addr a4{};
+    in6_addr a6{};
 
-    // Try IPv4
-    struct in_addr addr4{};
-    if (::inet_pton(AF_INET, host.c_str(), &addr4) == 1) {
+    if (::inet_pton(AF_INET, host.c_str(), &a4) == 1) {
         out.push_back(0x01);
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(&addr4);
+        const uint8_t *p = reinterpret_cast<const uint8_t*>(&a4);
         out.insert(out.end(), p, p + 4);
+    } else if (::inet_pton(AF_INET6, host.c_str(), &a6) == 1) {
+        out.push_back(0x04);
+        const uint8_t *p = reinterpret_cast<const uint8_t*>(&a6);
+        out.insert(out.end(), p, p + 16);
     } else {
-        // Try IPv6
-        struct in6_addr addr6{};
-        if (::inet_pton(AF_INET6, host.c_str(), &addr6) == 1) {
-            out.push_back(0x04);
-            const uint8_t* p = reinterpret_cast<const uint8_t*>(&addr6);
-            out.insert(out.end(), p, p + 16);
-        } else {
-            // Domain
-            if (host.size() > 255) {
-                std::cerr << "Host name too long\n";
-                return false;
-            }
-            out.push_back(0x03);
-            out.push_back(static_cast<uint8_t>(host.size()));
-            out.insert(out.end(), host.begin(), host.end());
-        }
+        size_t dlen = host.size();
+        if (dlen > 255) return false;
+        out.push_back(0x03);
+        out.push_back(static_cast<uint8_t>(dlen));
+        out.insert(out.end(), host.begin(), host.end());
     }
 
-    // Port
-    out.push_back(static_cast<uint8_t>((port >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>(port & 0xFF));
+    out.push_back(static_cast<uint8_t>((port >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(port & 0xff));
     return true;
 }
 
-// Connect to remote host:port, return fd or -1
-static int connect_remote(const std::string& host, uint16_t port) {
-    struct addrinfo hints{};
-    struct addrinfo* res = nullptr;
+// ---------- TCP per-client handler ----------
 
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+static void handle_client(int client_fd, const CryptoState &master_state) {
+    // Per-connection crypto state
+    CryptoState cs = master_state;
+    cs.has_subkey  = false;
 
-    std::string port_str = std::to_string(port);
-    int err = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
-    if (err != 0) {
-        std::cerr << "getaddrinfo(" << host << ":" << port_str
-                  << "): " << gai_strerror(err) << "\n";
-        return -1;
-    }
-
-    int fd = -1;
-    for (auto* rp = res; rp; rp = rp->ai_next) {
-        fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-
-        if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break; // success
-        }
-
-        ::close(fd);
-        fd = -1;
-    }
-
-    ::freeaddrinfo(res);
-    if (fd < 0) {
-        std::cerr << "Failed to connect to " << host << ":" << port << "\n";
-    }
-    return fd;
-}
-
-// ========= TCP per-client handler =========
-
-static void handle_client_tcp(int client_fd, std::string password) {
-    std::cout << "[*] New client\n";
-
-    // 1) Read salt for this connection
-    uint8_t salt[SS_SALT_LEN];
-    size_t got = 0;
-    while (got < SS_SALT_LEN) {
-        ssize_t n = ::recv(client_fd, salt + got, SS_SALT_LEN - got, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror_msg("recv salt");
-            ::close(client_fd);
-            return;
-        }
-        if (n == 0) {
-            std::cerr << "Client closed before sending salt\n";
-            ::close(client_fd);
-            return;
-        }
-        got += static_cast<size_t>(n);
-    }
-
-    // 2) Initialize crypto (master + subkey)
-    CryptoState cs{};
-    if (!crypto_init_master(cs, password)) {
-        std::cerr << "crypto_init_master failed\n";
-        ::close(client_fd);
-        return;
-    }
-    if (!crypto_init_session_from_salt(cs, salt, SS_SALT_LEN)) {
-        std::cerr << "crypto_init_session_from_salt failed\n";
-        ::close(client_fd);
-        return;
-    }
-
-    NonceCounter nonce_c2r{};
-    NonceCounter nonce_r2c{};
+    NonceCounter nonce_c2r;
+    NonceCounter nonce_r2c;
     nonce_reset(nonce_c2r);
     nonce_reset(nonce_r2c);
 
-    // 3) Read & decrypt first chunk until we have the full header
-    std::vector<uint8_t> c2r_inbuf;       // encrypted from client
-    std::vector<uint8_t> first_plain;     // decrypted first chunk
-    bool first_chunk_done = false;
+    // Make client non-blocking
+    (void)set_nonblock(client_fd);
 
-    const size_t BUF_SIZE = 4096;
-    std::vector<uint8_t> tmp(BUF_SIZE);
+    // 1) Read salt (SS_SALT_LEN bytes)
+    uint8_t salt[SS_SALT_LEN];
+    size_t  salt_got = 0;
+    std::vector<uint8_t> cbuf;  // ciphertext buffer after salt
 
-    while (!first_chunk_done) {
-        ssize_t n = ::recv(client_fd, tmp.data(), tmp.size(), 0);
+    while (salt_got < SS_SALT_LEN) {
+        uint8_t tmp[4096];
+        ssize_t n = ::recv(client_fd, tmp, sizeof(tmp), 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            perror_msg("recv first chunk");
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Wait briefly
+                struct pollfd pfd { client_fd, POLLIN, 0 };
+                int pret = ::poll(&pfd, 1, 5000);
+                if (pret <= 0) {
+                    std::cerr << "[*] Salt recv timeout / error\n";
+                    ::close(client_fd);
+                    return;
+                }
+                continue;
+            }
+            perror_msg("[C] recv salt");
             ::close(client_fd);
             return;
         }
         if (n == 0) {
-            std::cerr << "Client closed during first chunk\n";
+            std::cerr << "[*] Client closed before salt\n";
             ::close(client_fd);
             return;
         }
 
-        c2r_inbuf.insert(c2r_inbuf.end(), tmp.begin(), tmp.begin() + n);
+        size_t to_copy = std::min<size_t>(SS_SALT_LEN - salt_got, n);
+        std::memcpy(salt + salt_got, tmp, to_copy);
+        salt_got += to_copy;
 
+        if (n > (ssize_t)to_copy) {
+            // Extra bytes are already encrypted data
+            cbuf.insert(cbuf.end(), tmp + to_copy, tmp + n);
+        }
+    }
+
+    if (!crypto_init_session_from_salt(cs, salt, SS_SALT_LEN)) {
+        std::cerr << "[CRYPTO] failed to init session from salt\n";
+        ::close(client_fd);
+        return;
+    }
+
+    std::cerr << "[*] New client\n";
+    std::cerr << "[CRYPTO] master_key=" << hex_str(cs.master_key, SS_KEY_LEN) << "\n";
+    std::cerr << "[CRYPTO] salt=" << hex_str(salt, SS_SALT_LEN) << "\n";
+    std::cerr << "[CRYPTO] subkey=" << hex_str(cs.subkey, SS_KEY_LEN) << "\n";
+
+    // 2) First decrypted chunk must contain addr header
+    int remote_fd = -1;
+    std::string target_host;
+    uint16_t target_port = 0;
+
+    std::vector<uint8_t> plain;
+    bool first_chunk_ok = false;
+
+    while (!first_chunk_ok) {
         size_t consumed = 0;
-        std::vector<uint8_t> plain;
-        DecryptStatus st = ss_decrypt_chunk(cs,
-                                            nonce_c2r,
-                                            c2r_inbuf.data(),
-                                            c2r_inbuf.size(),
-                                            consumed,
-                                            plain);
-        if (st == DecryptStatus::NEED_MORE) {
-            continue; // read more ciphertext
-        } else if (st == DecryptStatus::ERROR) {
+        DecryptStatus st =
+            ss_decrypt_chunk(cs, nonce_c2r, cbuf.data(), cbuf.size(), consumed, plain);
+        if (st == DecryptStatus::ERROR) {
             std::cerr << "Decrypt error for first chunk\n";
             ::close(client_fd);
             return;
-        } else {
-            // OK
-            first_plain = std::move(plain);
-            c2r_inbuf.erase(c2r_inbuf.begin(),
-                            c2r_inbuf.begin() + static_cast<long>(consumed));
-            first_chunk_done = true;
-        }
-    }
-
-    // 4) Parse target from first_plain
-    std::string target_host;
-    uint16_t target_port = 0;
-    size_t header_len = 0;
-    if (!parse_ss_target(first_plain, target_host, target_port, header_len)) {
-        std::cerr << "Failed to parse target from first chunk\n";
-        ::close(client_fd);
-        return;
-    }
-
-    std::cout << "Target: " << target_host << ":" << target_port << "\n";
-
-    // 5) Connect to remote
-    int remote_fd = connect_remote(target_host, target_port);
-    if (remote_fd < 0) {
-        ::close(client_fd);
-        return;
-    }
-
-    // Any leftover data in first_plain after header = payload
-    if (header_len < first_plain.size()) {
-        const uint8_t* p = first_plain.data() + header_len;
-        size_t payload_len = first_plain.size() - header_len;
-        if (payload_len > 0) {
-            if (!send_all(remote_fd, p, payload_len)) {
+        } else if (st == DecryptStatus::NEED_MORE) {
+            uint8_t tmp[4096];
+            ssize_t n = ::recv(client_fd, tmp, sizeof(tmp), 0);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    struct pollfd pfd { client_fd, POLLIN, 0 };
+                    int pret = ::poll(&pfd, 1, 5000);
+                    if (pret <= 0) {
+                        std::cerr << "[*] First chunk timeout\n";
+                        ::close(client_fd);
+                        return;
+                    }
+                    continue;
+                }
+                perror_msg("[C] recv first chunk");
                 ::close(client_fd);
-                ::close(remote_fd);
                 return;
             }
+            if (n == 0) {
+                std::cerr << "[*] Client EOF before first chunk\n";
+                ::close(client_fd);
+                return;
+            }
+            cbuf.insert(cbuf.end(), tmp, tmp + n);
+            continue;
         }
+
+        // st == OK
+        cbuf.erase(cbuf.begin(), cbuf.begin() + consumed);
+
+        size_t hdr_consumed = 0;
+        if (!parse_ss_addr(plain.data(), plain.size(), hdr_consumed,
+                           target_host, target_port)) {
+            std::cerr << "Failed to parse addr header in first chunk\n";
+            ::close(client_fd);
+            return;
+        }
+
+        std::cerr << "Target: " << target_host << ":" << target_port << "\n";
+
+        // Connect to remote
+        struct addrinfo hints{};
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        struct addrinfo *res = nullptr;
+        std::string port_str = std::to_string(target_port);
+        int gai = ::getaddrinfo(target_host.c_str(), port_str.c_str(), &hints, &res);
+        if (gai != 0) {
+            std::cerr << "getaddrinfo failed: " << ::gai_strerror(gai) << "\n";
+            ::close(client_fd);
+            return;
+        }
+
+        int sfd = -1;
+        for (auto *rp = res; rp != nullptr; rp = rp->ai_next) {
+            sfd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (sfd < 0) continue;
+            if (::connect(sfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+                remote_fd = sfd;
+                break;
+            }
+            ::close(sfd);
+            sfd = -1;
+        }
+        ::freeaddrinfo(res);
+
+        if (remote_fd < 0) {
+            std::cerr << "Failed to connect remote\n";
+            ::close(client_fd);
+            return;
+        }
+        (void)set_nonblock(remote_fd);
+
+        // Any remaining plaintext after header is first payload -> send to remote
+        if (hdr_consumed < plain.size()) {
+            ssize_t wn = ::send(remote_fd,
+                                plain.data() + hdr_consumed,
+                                plain.size() - hdr_consumed,
+                                0);
+            (void)wn;
+        }
+
+        first_chunk_ok = true;
     }
 
-    // 6) Full-duplex relay loop using poll()
+    // 3) Relay loop: client <-> remote
+    std::vector<uint8_t> c2r_buf = cbuf; // leftover ciphertext from client (usually empty)
+    std::vector<uint8_t> r2c_plain;      // plaintext from remote -> client
+    cbuf.clear();
+
     bool client_read_closed = false;
+    bool client_write_closed = false;
     bool remote_read_closed = false;
+    bool remote_write_closed = false;
 
-    while (!(client_read_closed && remote_read_closed)) {
+    const int TIMEOUT_MS = 300000; // 5 minutes idle
+
+    while (true) {
+        if ((client_read_closed || client_fd < 0) &&
+            (remote_read_closed || remote_fd < 0)) {
+            break;
+        }
+
         struct pollfd fds[2];
-        fds[0].fd = client_fd;
-        fds[0].events = client_read_closed ? 0 : POLLIN;
-        fds[1].fd = remote_fd;
-        fds[1].events = remote_read_closed ? 0 : POLLIN;
+        nfds_t nfds = 0;
 
-        int ret = ::poll(fds, 2, -1);
-        if (ret < 0) {
+        if (!client_read_closed && client_fd >= 0) {
+            fds[nfds].fd     = client_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            ++nfds;
+        }
+        if (!remote_read_closed && remote_fd >= 0) {
+            fds[nfds].fd     = remote_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            ++nfds;
+        }
+
+        int pret = ::poll(fds, nfds, TIMEOUT_MS);
+        if (pret < 0) {
             if (errno == EINTR) continue;
             perror_msg("poll");
             break;
         }
+        if (pret == 0) {
+            std::cerr << "[*] poll timeout, closing connection\n";
+            break;
+        }
+
+        nfds_t idx = 0;
 
         // ----- client -> remote -----
-        if (!client_read_closed && (fds[0].revents & (POLLIN | POLLERR | POLLHUP))) {
-            ssize_t n = ::recv(client_fd, tmp.data(), tmp.size(), 0);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    // ignore
-                } else {
-                    perror_msg("[C->R] recv");
-                    break;
-                }
-            } else if (n == 0) {
-                // Client closed its write side
-                client_read_closed = true;
-                ::shutdown(remote_fd, SHUT_WR);
-            } else {
-                std::cout << "[C->R] recv() got " << n
-                          << " bytes, inbuf=" << (c2r_inbuf.size() + n) << "\n";
+        if (!client_read_closed && client_fd >= 0) {
+            short re = fds[idx].revents;
+            int cfd  = fds[idx].fd;
+            ++idx;
 
-                c2r_inbuf.insert(c2r_inbuf.end(), tmp.begin(), tmp.begin() + n);
-
-                // Decrypt as many complete chunks as available
-                while (!c2r_inbuf.empty()) {
-                    size_t consumed = 0;
-                    std::vector<uint8_t> plain;
-                    DecryptStatus st = ss_decrypt_chunk(cs,
-                                                        nonce_c2r,
-                                                        c2r_inbuf.data(),
-                                                        c2r_inbuf.size(),
-                                                        consumed,
-                                                        plain);
-                    if (st == DecryptStatus::NEED_MORE) {
-                        break;
-                    } else if (st == DecryptStatus::ERROR) {
-                        std::cerr << "[C->R] decrypt error in relay\n";
-                        client_read_closed = true;
-                        ::shutdown(remote_fd, SHUT_WR);
-                        break;
+            if (re & (POLLIN | POLLERR | POLLHUP)) {
+                uint8_t tmp[4096];
+                ssize_t n = ::recv(cfd, tmp, sizeof(tmp), 0);
+                if (n < 0) {
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // ignore transient
                     } else {
-                        // OK
-                        if (!plain.empty()) {
-                            if (!send_all(remote_fd, plain.data(), plain.size())) {
-                                std::cerr << "[C->R] send_all to remote failed\n";
-                                client_read_closed = true;
-                                remote_read_closed = true;
+                        perror_msg("[C->R] recv");
+                        break;
+                    }
+                } else if (n == 0) {
+                    client_read_closed = true;
+                    if (!remote_write_closed && remote_fd >= 0) {
+                        ::shutdown(remote_fd, SHUT_WR);
+                        remote_write_closed = true;
+                    }
+                } else {
+                    c2r_buf.insert(c2r_buf.end(), tmp, tmp + n);
+
+                    while (!c2r_buf.empty()) {
+                        size_t consumed = 0;
+                        std::vector<uint8_t> plain_chunk;
+                        DecryptStatus st =
+                            ss_decrypt_chunk(cs,
+                                             nonce_c2r,
+                                             c2r_buf.data(),
+                                             c2r_buf.size(),
+                                             consumed,
+                                             plain_chunk);
+                        if (st == DecryptStatus::ERROR) {
+                            std::cerr << "Decrypt error in client_to_remote\n";
+                            client_read_closed = true;
+                            if (!remote_write_closed && remote_fd >= 0) {
+                                ::shutdown(remote_fd, SHUT_WR);
+                                remote_write_closed = true;
+                            }
+                            break;
+                        } else if (st == DecryptStatus::NEED_MORE) {
+                            break;
+                        }
+
+                        c2r_buf.erase(c2r_buf.begin(),
+                                      c2r_buf.begin() + consumed);
+
+                        size_t off = 0;
+                        while (off < plain_chunk.size()) {
+                            ssize_t wn = ::send(remote_fd,
+                                                plain_chunk.data() + off,
+                                                plain_chunk.size() - off,
+                                                0);
+                            if (wn < 0) {
+                                if (errno == EINTR) continue;
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    struct pollfd wfd { remote_fd, POLLOUT, 0 };
+                                    ::poll(&wfd, 1, 5000);
+                                    continue;
+                                }
+                                perror_msg("[C->R] send");
+                                remote_write_closed = true;
+                                if (!client_read_closed) {
+                                    ::shutdown(client_fd, SHUT_RD);
+                                    client_read_closed = true;
+                                }
+                                off = plain_chunk.size();
                                 break;
                             }
-                        }
-                        if (consumed > 0) {
-                            c2r_inbuf.erase(
-                                c2r_inbuf.begin(),
-                                c2r_inbuf.begin() + static_cast<long>(consumed));
-                        } else {
-                            // should not happen; avoid infinite loop
-                            break;
+                            off += static_cast<size_t>(wn);
                         }
                     }
                 }
             }
+        } else {
+            ++idx; // keep index in sync if client skipped
         }
 
         // ----- remote -> client -----
-        if (!remote_read_closed && (fds[1].revents & (POLLIN | POLLERR | POLLHUP))) {
-            ssize_t n = ::recv(remote_fd, tmp.data(), tmp.size(), 0);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    // ignore
+        if (!remote_read_closed && remote_fd >= 0) {
+            short re = fds[idx - (client_fd >= 0 && !client_read_closed ? 0 : 1)].revents;
+            int rfd  = fds[idx - (client_fd >= 0 && !client_read_closed ? 0 : 1)].fd;
+
+            if (re & (POLLIN | POLLERR | POLLHUP)) {
+                uint8_t tmp[4096];
+                ssize_t n = ::recv(rfd, tmp, sizeof(tmp), 0);
+                if (n < 0) {
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // ignore
+                    } else {
+                        perror_msg("[R->C] recv");
+                        break;
+                    }
+                } else if (n == 0) {
+                    remote_read_closed = true;
+                    if (!client_write_closed && client_fd >= 0) {
+                        ::shutdown(client_fd, SHUT_WR);
+                        client_write_closed = true;
+                    }
                 } else {
-                    perror_msg("[R->C] recv");
-                    break;
-                }
-            } else if (n == 0) {
-                // Remote closed its write side
-                remote_read_closed = true;
-                ::shutdown(client_fd, SHUT_WR);
-            } else {
-                size_t offset = 0;
-                while (offset < static_cast<size_t>(n)) {
-                    size_t chunk_len =
-                        std::min(SS_MAX_PAYLOAD, static_cast<size_t>(n) - offset);
+                    // Encrypt this as one or more SS chunks
+                    size_t off = 0;
+                    while (off < static_cast<size_t>(n)) {
+                        size_t chunk_len =
+                            std::min(SS_MAX_PAYLOAD,
+                                     static_cast<size_t>(n) - off);
+                        std::vector<uint8_t> enc_chunk;
+                        if (!ss_encrypt_chunk(cs,
+                                              nonce_r2c,
+                                              tmp + off,
+                                              static_cast<uint16_t>(chunk_len),
+                                              enc_chunk)) {
+                            std::cerr << "[R->C] encrypt failed\n";
+                            remote_read_closed = true;
+                            break;
+                        }
 
-                    std::vector<uint8_t> enc_chunk;
-                    if (!ss_encrypt_chunk(cs,
-                                          nonce_r2c,
-                                          tmp.data() + offset,
-                                          static_cast<uint16_t>(chunk_len),
-                                          enc_chunk)) {
-                        std::cerr << "[R->C] encrypt failed\n";
-                        client_read_closed = true;
-                        remote_read_closed = true;
-                        break;
+                        size_t sent_off = 0;
+                        while (sent_off < enc_chunk.size()) {
+                            ssize_t wn = ::send(client_fd,
+                                                enc_chunk.data() + sent_off,
+                                                enc_chunk.size() - sent_off,
+                                                0);
+                            if (wn < 0) {
+                                if (errno == EINTR) continue;
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    struct pollfd wfd { client_fd, POLLOUT, 0 };
+                                    ::poll(&wfd, 1, 5000);
+                                    continue;
+                                }
+                                perror_msg("[R->C] send");
+                                client_write_closed = true;
+                                break;
+                            }
+                            sent_off += static_cast<size_t>(wn);
+                        }
+                        if (client_write_closed) break;
+                        off += chunk_len;
                     }
-
-                    if (!send_all(client_fd, enc_chunk.data(), enc_chunk.size())) {
-                        std::cerr << "[R->C] send_all to client failed\n";
-                        client_read_closed = true;
-                        remote_read_closed = true;
-                        break;
-                    }
-
-                    offset += chunk_len;
                 }
             }
         }
     }
 
-    ::close(client_fd);
-    ::close(remote_fd);
-    std::cout << "[*] Client done\n";
+    if (remote_fd >= 0) ::close(remote_fd);
+    if (client_fd >= 0) ::close(client_fd);
+    std::cerr << "[*] Client done\n";
 }
 
-// ========= UDP relay loop =========
+// ---------- UDP server (Shadowsocks UDP relay) ----------
 //
-// Uses ss_udp_decrypt/ss_udp_encrypt declared in crypto.hpp
-// and implemented in crypto.cpp, so NO static redefinitions here.
+// Assumes crypto.cpp implements:
+//   bool ss_udp_decrypt(const CryptoState& master_state,
+//                       const uint8_t* packet, size_t packet_len,
+//                       std::vector<uint8_t>& plain_out);
+//
+//   bool ss_udp_encrypt(const CryptoState& master_state,
+//                       const uint8_t* plaintext, size_t plaintext_len,
+//                       std::vector<uint8_t>& packet_out);
+//
 
-static void udp_server_loop(uint16_t listen_port, std::string password) {
-    int sock = ::socket(AF_INET6, SOCK_DGRAM, 0);
+bool ss_udp_decrypt(const CryptoState& master_state,
+                    const uint8_t* packet,
+                    size_t packet_len,
+                    std::vector<uint8_t>& plain_out);
+
+bool ss_udp_encrypt(const CryptoState& master_state,
+                    const uint8_t* plaintext,
+                    size_t plaintext_len,
+                    std::vector<uint8_t>& packet_out);
+
+void udp_server_loop(uint16_t listen_port, std::string password) {
+    CryptoState master{};
+    if (!crypto_init_master(master, password)) {
+        std::cerr << "[UDP] failed to init master key\n";
+        return;
+    }
+
+    int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        perror_msg("socket(AF_INET6, UDP)");
+        perror_msg("[UDP] socket");
         return;
     }
 
-    int on = 1;
-    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    int off = 0;
-    ::setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    int opt = 1;
+    ::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port   = htons(listen_port);
-    addr.sin6_addr   = in6addr_any;
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(listen_port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        perror_msg("bind UDP");
+    if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror_msg("[UDP] bind");
         ::close(sock);
         return;
     }
 
-    std::cout << "[UDP] listening on 0.0.0.0:" << listen_port << "\n";
+    std::cerr << "[UDP] listening on 0.0.0.0:" << listen_port << "\n";
 
-    CryptoState master_state{};
-    if (!crypto_init_master(master_state, password)) {
-        std::cerr << "[UDP] crypto_init_master failed\n";
-        ::close(sock);
-        return;
-    }
+    uint8_t buf[65535];
 
-    const size_t BUF_SIZE = 65535;
-    std::vector<uint8_t> buf(BUF_SIZE);
-
-    for (;;) {
-        struct sockaddr_storage cliaddr{};
-        socklen_t clilen = sizeof(cliaddr);
-        ssize_t n = ::recvfrom(sock,
-                               buf.data(),
-                               buf.size(),
-                               0,
-                               reinterpret_cast<struct sockaddr*>(&cliaddr),
-                               &clilen);
+    while (true) {
+        sockaddr_in cli{};
+        socklen_t clilen = sizeof(cli);
+        ssize_t n = ::recvfrom(sock, buf, sizeof(buf), 0,
+                               reinterpret_cast<sockaddr*>(&cli), &clilen);
         if (n < 0) {
             if (errno == EINTR) continue;
             perror_msg("[UDP] recvfrom");
+            break;
+        }
+        if (n == 0) continue;
+
+        std::vector<uint8_t> plain;
+        if (!ss_udp_decrypt(master, buf, static_cast<size_t>(n), plain)) {
+            std::cerr << "[UDP] decrypt failed\n";
             continue;
         }
 
-        std::cout << "[UDP] got " << n << " bytes from client\n";
-
-        std::vector<uint8_t> addr_plus_payload;
-        if (!ss_udp_decrypt(master_state,
-                            buf.data(),
-                            static_cast<size_t>(n),
-                            addr_plus_payload)) {
-            continue;
-        }
-
-        // Parse target
+        // plain = [ADDR][PAYLOAD]
         std::string host;
         uint16_t port = 0;
-        size_t header_len = 0;
-        if (!parse_ss_target(addr_plus_payload, host, port, header_len)) {
-            std::cerr << "[UDP] parse_ss_target failed\n";
+        size_t addr_consumed = 0;
+        if (!parse_ss_addr(plain.data(), plain.size(), addr_consumed,
+                           host, port)) {
+            std::cerr << "[UDP] addr parse failed\n";
             continue;
         }
 
-        const uint8_t* payload = addr_plus_payload.data() + header_len;
-        size_t payload_len     = addr_plus_payload.size() - header_len;
+        if (addr_consumed >= plain.size()) {
+            continue;
+        }
 
-        std::cout << "[UDP] target=" << host << ":" << port
+        const uint8_t *payload = plain.data() + addr_consumed;
+        size_t payload_len     = plain.size() - addr_consumed;
+
+        std::cerr << "[UDP] target=" << host << ":" << port
                   << " payload_len=" << payload_len << "\n";
 
-        // Send payload to remote via UDP
-        struct addrinfo hints{};
-        struct addrinfo* res = nullptr;
-        hints.ai_family   = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
-
-        std::string port_str = std::to_string(port);
-        int err = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
-        if (err != 0 || !res) {
-            std::cerr << "[UDP] getaddrinfo(" << host << ":" << port_str
-                      << "): " << gai_strerror(err) << "\n";
-            if (res) ::freeaddrinfo(res);
-            continue;
-        }
-
-        int rsock = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        // Send via UDP to remote
+        int rsock = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (rsock < 0) {
-            perror_msg("[UDP] remote socket");
-            ::freeaddrinfo(res);
+            perror_msg("[UDP] rsock");
             continue;
         }
 
-        ssize_t sent = ::sendto(rsock,
-                                payload,
-                                payload_len,
-                                0,
-                                res->ai_addr,
-                                res->ai_addrlen);
-        if (sent < 0) {
-            perror_msg("[UDP] sendto remote");
+        sockaddr_in raddr{};
+        raddr.sin_family = AF_INET;
+        raddr.sin_port   = htons(port);
+
+        if (::inet_pton(AF_INET, host.c_str(), &raddr.sin_addr) != 1) {
+            // simple: do not resolve domains here to keep code compact
             ::close(rsock);
-            ::freeaddrinfo(res);
             continue;
         }
 
-        // Wait for a single response (good for DNS/most UDP)
+        ssize_t sn = ::sendto(rsock, payload, payload_len, 0,
+                              reinterpret_cast<sockaddr*>(&raddr),
+                              sizeof(raddr));
+        (void)sn;
+
+        // Wait for reply (best-effort, single packet)
         struct pollfd pfd;
         pfd.fd     = rsock;
         pfd.events = POLLIN;
-        int pret   = ::poll(&pfd, 1, 1500); // 1.5s timeout
+        int pret   = ::poll(&pfd, 1, 1500);
         if (pret <= 0) {
             ::close(rsock);
-            ::freeaddrinfo(res);
             continue;
         }
 
-        std::vector<uint8_t> rbuf(BUF_SIZE);
-        ssize_t rn = ::recvfrom(rsock,
-                                rbuf.data(),
-                                rbuf.size(),
-                                0,
-                                nullptr,
-                                nullptr);
+        uint8_t rbuf[65535];
+        ssize_t rn = ::recvfrom(rsock, rbuf, sizeof(rbuf), 0, nullptr, nullptr);
         ::close(rsock);
-        ::freeaddrinfo(res);
+        if (rn <= 0) continue;
 
-        if (rn <= 0) {
-            if (rn < 0) perror_msg("[UDP] recvfrom remote");
-            continue;
-        }
-
-        // Build ADDR header + payload for response
+        // Build ADDR + payload
         std::vector<uint8_t> resp_plain;
         if (!build_ss_addr_header(host, port, resp_plain)) {
             continue;
         }
-        resp_plain.insert(resp_plain.end(), rbuf.begin(), rbuf.begin() + rn);
+        resp_plain.insert(resp_plain.end(), rbuf, rbuf + rn);
 
         std::vector<uint8_t> out_packet;
-        if (!ss_udp_encrypt(master_state,
+        if (!ss_udp_encrypt(master,
                             resp_plain.data(),
                             resp_plain.size(),
                             out_packet)) {
+            std::cerr << "[UDP] encrypt failed\n";
             continue;
         }
 
-
-        // Send back to client
-        ssize_t sn = ::sendto(sock,
-                              out_packet.data(),
-                              out_packet.size(),
-                              0,
-                              reinterpret_cast<struct sockaddr*>(&cliaddr),
-                              clilen);
-        if (sn < 0) {
-            perror_msg("[UDP] sendto client");
-            continue;
-        }
-
-        std::cout << "[UDP] sent reply packet of " << sn << " bytes back to client\n";
+        ::sendto(sock,
+                 out_packet.data(),
+                 out_packet.size(),
+                 0,
+                 reinterpret_cast<sockaddr*>(&cli),
+                 clilen);
     }
 
     ::close(sock);
 }
 
-// ========= ShadowsocksServer =========
+// ---------- TCP listen loop & run_server entry ----------
 
-ShadowsocksServer::ShadowsocksServer(const std::string& host,
-                                     uint16_t port,
-                                     const std::string& password)
-    : listen_host_(host),
-      listen_port_(port),
-      password_(password) {}
-
-void ShadowsocksServer::run() {
-    // TCP listen socket
-    int listen_fd = ::socket(AF_INET6, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        perror_msg("socket(AF_INET6)");
+static void tcp_server_loop(const std::string &listen_host,
+                            uint16_t listen_port,
+                            const std::string &password) {
+    CryptoState master{};
+    if (!crypto_init_master(master, password)) {
+        std::cerr << "[TCP] failed to init master key\n";
         return;
     }
 
-    int on = 1;
-    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-    // Allow IPv4-mapped on IPv6 (so 0.0.0.0 works via ::)
-    int off = 0;
-    ::setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
-
-    struct sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port   = htons(listen_port_);
-    addr.sin6_addr   = in6addr_any;
-
-    if (::bind(listen_fd,
-               reinterpret_cast<struct sockaddr*>(&addr),
-               sizeof(addr)) < 0) {
-        perror_msg("bind");
-        ::close(listen_fd);
+    int lsock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock < 0) {
+        perror_msg("[TCP] socket");
         return;
     }
 
-    if (::listen(listen_fd, 128) < 0) {
-        perror_msg("listen");
-        ::close(listen_fd);
+    int opt = 1;
+    ::setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(listen_port);
+    addr.sin_addr.s_addr =
+        listen_host.empty() ? htonl(INADDR_ANY) : inet_addr(listen_host.c_str());
+    if (addr.sin_addr.s_addr == INADDR_NONE && !listen_host.empty()) {
+        perror_msg("[TCP] invalid listen_host");
+        ::close(lsock);
         return;
     }
 
-    std::cout << "Listening on 0.0.0.0:" << listen_port_ << "\n";
+    if (::bind(lsock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror_msg("[TCP] bind");
+        ::close(lsock);
+        return;
+    }
 
-    // Start UDP relay on same port
-    std::thread(udp_server_loop, listen_port_, password_).detach();
+    if (::listen(lsock, 128) < 0) {
+        perror_msg("[TCP] listen");
+        ::close(lsock);
+        return;
+    }
 
-    for (;;) {
-        struct sockaddr_storage cliaddr{};
-        socklen_t clilen = sizeof(cliaddr);
-        int cfd = ::accept(listen_fd,
-                           reinterpret_cast<struct sockaddr*>(&cliaddr),
-                           &clilen);
+    std::cerr << "Listening on " << listen_host << ":" << listen_port << "\n";
+
+    while (true) {
+        sockaddr_in cli{};
+        socklen_t clilen = sizeof(cli);
+        int cfd = ::accept(lsock, reinterpret_cast<sockaddr*>(&cli), &clilen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            perror_msg("accept");
-            continue;
+            perror_msg("[TCP] accept");
+            break;
         }
 
-        // Spawn a detached thread per TCP client
-        std::thread th(handle_client_tcp, cfd, password_);
+        std::thread th(handle_client, cfd, master);
         th.detach();
     }
 
-    ::close(listen_fd);
+    ::close(lsock);
+}
+
+int run_server(const std::string &listen_host,
+               uint16_t listen_port,
+               const std::string &password) {
+    std::thread udp_thr(udp_server_loop, listen_port, password);
+    tcp_server_loop(listen_host, listen_port, password);
+    udp_thr.join();
+    return 0;
 }
