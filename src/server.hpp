@@ -1,19 +1,14 @@
+// src/server.hpp
 #pragma once
 
-#include <cstdint>
 #include <string>
+#include <cstdint>
 
-class ShadowsocksServer {
-public:
-    ShadowsocksServer(const std::string& host,
-                      uint16_t port,
-                      const std::string& password);
+// Start TCP + UDP Shadowsocks server on given host/port with password.
+// This is implemented in server.cpp.
+int run_server(const std::string &listen_host,
+               uint16_t listen_port,
+               const std::string &password);
 
-    // Blocking run() – starts TCP listener (and optionally UDP in server.cpp)
-    void run();
-
-private:
-    std::string listen_host_;
-    uint16_t listen_port_;
-    std::string password_;
-};
+// UDP loop is exposed for completeness, but you normally just call run_server().
+void udp_server_loop(uint16_t listen_port, std::string password);

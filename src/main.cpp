@@ -1,57 +1,52 @@
-#include "server.hpp"
+// src/main.cpp
 #include "crypto.hpp"
+#include "server.hpp"
 
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
 #include <string>
 
-static std::string getenv_or(const char* name, const std::string& def) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return def;
+static std::string get_env_str(const char *name,
+                               const std::string &def_val) {
+    const char *v = std::getenv(name);
+    if (!v || !*v) return def_val;
     return std::string(v);
 }
 
-static uint16_t getenv_port_or(const char* name, uint16_t def) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return def;
-    try {
-        int p = std::stoi(v);
-        if (p <= 0 || p > 65535) return def;
-        return static_cast<uint16_t>(p);
-    } catch (...) {
-        return def;
-    }
+static uint16_t get_env_port(const char *name, uint16_t def_val) {
+    const char *v = std::getenv(name);
+    if (!v || !*v) return def_val;
+    long p = std::strtol(v, nullptr, 10);
+    if (p <= 0 || p > 65535) return def_val;
+    return static_cast<uint16_t>(p);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
     if (!crypto_global_init()) {
-        std::cerr << "crypto_global_init() failed\n";
+        std::cerr << "[FATAL] crypto_global_init() failed\n";
         return 1;
     }
 
-    // Read from env (Docker / docker-compose)
-    std::string host     = getenv_or("SS_LISTEN_HOST", "0.0.0.0");
-    uint16_t    port     = getenv_port_or("SS_LISTEN_PORT", 8089);
-    std::string password = getenv_or("SS_PASSWORD", "");
+    // Environment variables (same as before):
+    //   SS_LISTEN_HOST  (default: "0.0.0.0")
+    //   SS_LISTEN_PORT  (default: 8089)
+    //   SS_PASSWORD     (no default; must be set in production)
+    std::string host = get_env_str("SS_LISTEN_HOST", "0.0.0.0");
+    uint16_t port    = get_env_port("SS_LISTEN_PORT", 8089);
+    std::string password = get_env_str("SS_PASSWORD", "");
 
     if (password.empty()) {
-        std::cerr << "ERROR: SS_PASSWORD is not set\n";
+        std::cerr << "[FATAL] SS_PASSWORD is not set\n";
         return 1;
     }
 
-    std::cout << "Starting Shadowsocks C++ server on " << host << ":" << port
-              << " with method chacha20-ietf-poly1305\n";
+    std::cerr << "[CONFIG] host=" << host
+              << " port=" << port
+              << " password_len=" << password.size() << "\n";
 
-    try {
-        ShadowsocksServer server(host, port, password);
-        server.run();
-    } catch (const std::exception& ex) {
-        std::cerr << "Fatal error: " << ex.what() << "\n";
-        return 1;
-    }
-
-    return 0;
+    return run_server(host, port, password);
 }
